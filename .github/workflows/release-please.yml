@@ -1,24 +1,16 @@
-name: Release Please
+# ФАЙЛ ОТКЛЮЧЕН — заменён на zmey-release.yml
+# Release Please не поддерживает формат vX.Y.ZzN
+name: Release Please (disabled)
 
 on:
-  push:
-    branches:
-      - main
-
-permissions:
-  contents: write
-  pull-requests: write
+  workflow_dispatch:
+    inputs:
+      reason:
+        description: 'This workflow is disabled. Use zmey-release.yml instead.'
+        required: false
 
 jobs:
-  release-please:
+  noop:
     runs-on: ubuntu-latest
-    outputs:
-      release_created: ${{ steps.release.outputs.release_created }}
-      tag_name: ${{ steps.release.outputs.tag_name }}
-      version: ${{ steps.release.outputs.version }}
     steps:
-      - uses: googleapis/release-please-action@v4
-        id: release
-        with:
-          config-file: release-please-config.json
-          manifest-file: .release-please-manifest.json
+      - run: echo 'Release Please disabled. Use zmey-release.yml instead.'

@@ -4,17 +4,17 @@ on:
   push:
     branches:
       - main
-      - dev 
+      - dev
     tags:
       - 'v*'
   pull_request:
     branches:
       - main
-      - dev 
+      - dev
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
+  IMAGE_NAME: zmey93/remnawave-bedolaga-telegram-bot
 
 jobs:
   build-and-push:
@@ -24,9 +24,9 @@ jobs:
       packages: write
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0  
+          fetch-depth: 0
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -42,31 +42,34 @@ jobs:
       - name: Get version info
         id: version
         run: |
-          echo "short_sha=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-          echo "build_date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> $GITHUB_OUTPUT
-          
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
+          echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
+
           if [[ $GITHUB_REF == refs/tags/* ]]; then
             VERSION=${GITHUB_REF#refs/tags/}
             echo "🏷️ Building release version: $VERSION"
           elif [[ $GITHUB_REF == refs/heads/main ]]; then
-            VERSION="v3.7.0-$(git rev-parse --short HEAD)" # x-release-please-version
-            echo "🚀 Building main version: $VERSION"
+            UPSTREAM=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "//;s/"//')
+            ZMEY=$(cat .zmey_version | tr -d '[:space:]')
+            VERSION="v${UPSTREAM}z${ZMEY}-${SHORT_SHA}"
+            echo "🚀 Building main snapshot: $VERSION"
           elif [[ $GITHUB_REF == refs/heads/dev ]]; then
-            VERSION="v3.7.0-dev-$(git rev-parse --short HEAD)" # x-release-please-version
-            echo "🧪 Building dev version: $VERSION"
+            UPSTREAM=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "//;s/"//')
+            ZMEY=$(cat .zmey_version | tr -d '[:space:]')
+            VERSION="v${UPSTREAM}z${ZMEY}-dev-${SHORT_SHA}"
+            echo "🧪 Building dev snapshot: $VERSION"
           else
-            VERSION="v3.7.0-pr-$(git rev-parse --short HEAD)" # x-release-please-version
+            VERSION="pr-${SHORT_SHA}"
             echo "🔀 Building PR version: $VERSION"
           fi
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          
-          # Определяем, нужно ли пушить образ
+
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             echo "should_push=false" >> $GITHUB_OUTPUT
-            echo "⚠️ PR - only build without push"
           else
             echo "should_push=true" >> $GITHUB_OUTPUT
-            echo "✅ Push/Tag - will push"
           fi
 
       - name: Extract metadata
@@ -100,42 +103,13 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      - name: Generate security report
-        uses: docker/scout-action@v1
-        if: github.event_name == 'pull_request'
-        with:
-          command: quickview,compare
-          image: ${{ steps.meta.outputs.tags }}
-          to: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
-          ignore-unchanged: true
-          only-severities: critical,high
-          write-comment: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-        continue-on-error: true
-
       - name: Build Summary
-        if: steps.version.outputs.should_push == 'true'
         run: |
           echo "## 🚀 Docker Build Summary" >> $GITHUB_STEP_SUMMARY
           echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| **Version** | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Commit** | \`${{ steps.version.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Build Date** | \`${{ steps.version.outputs.build_date }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Registry** | \`${{ env.REGISTRY }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Image** | \`${{ env.IMAGE_NAME }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Branch** | \`${{ github.ref_name }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | ✅ Published |" >> $GITHUB_STEP_SUMMARY
-
-      - name: Build Summary (No Push)
-        if: steps.version.outputs.should_push == 'false'
-        run: |
-          echo "## 🔨 Docker Build Summary (Test Only)" >> $GITHUB_STEP_SUMMARY
-          echo "| Parameter | Value |" >> $GITHUB_STEP_SUMMARY
-          echo "|----------|----------|" >> $GITHUB_STEP_SUMMARY
-          echo "| **Version** | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Commit** | \`${{ steps.version.outputs.short_sha }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Build Date** | \`${{ steps.version.outputs.build_date }}\` |" >> $GITHUB_STEP_SUMMARY
-          echo "| **Status** | ✅ Built successfully (without publishing) |" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ **Note:** Image built but not published as this is a pull request." >> $GITHUB_STEP_SUMMARY
+          echo "| **Registry** | \`ghcr.io/zmey93/remnawave-bedolaga-telegram-bot\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Pushed** | ${{ steps.version.outputs.should_push }} |" >> $GITHUB_STEP_SUMMARY
