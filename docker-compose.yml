@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:15-alpine
+    image: postgres:17-alpine
     container_name: remnawave_bot_db
     restart: unless-stopped
     environment:
@@ -37,6 +37,24 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      
+  xray-checker:
+    image: kutovoys/xray-checker
+    container_name: xray_checker
+    restart: unless-stopped
+    environment:
+      - SUBSCRIPTION_URL=${XRAY_SUBSCRIPTION_URL}
+      - SUBSCRIPTION_UPDATE=true
+      - SUBSCRIPTION_UPDATE_INTERVAL=300
+      - PROXY_CHECK_INTERVAL=300
+      - PROXY_CHECK_METHOD=ip
+      - METRICS_HOST=0.0.0.0
+      - METRICS_PORT=2112
+      - METRICS_PROTECTED=true
+      - METRICS_USERNAME=doc93
+      - METRICS_PASSWORD=6185700
+    networks:
+      - bot_network
 
   bot:
     build: .
@@ -50,29 +68,22 @@ services:
     env_file:
       - .env
     environment:
-      FORCE_COLOR: '1'
       DOCKER_ENV: 'true'
       DATABASE_MODE: 'auto'
       POSTGRES_HOST: 'postgres'
       POSTGRES_PORT: '5432'
       POSTGRES_DB: '${POSTGRES_DB:-remnawave_bot}'
       POSTGRES_USER: '${POSTGRES_USER:-remnawave_user}'
-      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-secure_password_123}'
-
+      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-451f9ff680680f03e6ad507f13723bab4d052a72ff56917b}'
       REDIS_URL: 'redis://redis:6379/0'
-
       TZ: 'Europe/Moscow'
       LOCALES_PATH: '${LOCALES_PATH:-/app/locales}'
     volumes:
-      # Логи
       - ./logs:/app/logs:rw
-      # Данные приложения (для SQLite в случае переключения)
       - ./data:/app/data:rw
       - ./locales:/app/locales:rw
-      # Timezone
       - /etc/timezone:/etc/timezone:ro
       - /etc/localtime:/etc/localtime:ro
-      # Логотип для сообщений
       - ./vpn_logo.png:/app/vpn_logo.png:ro
     ports:
       - '${WEB_API_PORT:-8080}:8080'
@@ -97,6 +108,7 @@ volumes:
 
 networks:
   bot_network:
+    name: remnawave_bot_network
     driver: bridge
     ipam:
       config:
