@@ -1,4 +1,4 @@
-name: Build and Publish Docker Image
+name: Build and Publish Docker Image (GHCR)
 
 on:
   push:
@@ -31,11 +31,11 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Log in to Container Registry
+      - name: Log in to GHCR
         if: github.event_name != 'pull_request'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
@@ -47,17 +47,16 @@ jobs:
           echo "short_sha=$SHORT_SHA" >> $GITHUB_OUTPUT
           echo "build_date=$BUILD_DATE" >> $GITHUB_OUTPUT
 
+          UPSTREAM=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "//;s/"//')
+          ZMEY=$(cat .zmey_version | tr -d '[:space:]')
+
           if [[ $GITHUB_REF == refs/tags/* ]]; then
             VERSION=${GITHUB_REF#refs/tags/}
             echo "🏷️ Building release version: $VERSION"
           elif [[ $GITHUB_REF == refs/heads/main ]]; then
-            UPSTREAM=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "//;s/"//')
-            ZMEY=$(cat .zmey_version | tr -d '[:space:]')
             VERSION="v${UPSTREAM}z${ZMEY}-${SHORT_SHA}"
             echo "🚀 Building main snapshot: $VERSION"
           elif [[ $GITHUB_REF == refs/heads/dev ]]; then
-            UPSTREAM=$(grep '^version' pyproject.toml | head -1 | sed 's/version = "//;s/"//')
-            ZMEY=$(cat .zmey_version | tr -d '[:space:]')
             VERSION="v${UPSTREAM}z${ZMEY}-dev-${SHORT_SHA}"
             echo "🧪 Building dev snapshot: $VERSION"
           else
@@ -82,7 +81,6 @@ jobs:
             type=ref,event=pr
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
             type=raw,value=latest,enable={{is_default_branch}}
             type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
             type=raw,value=${{ steps.version.outputs.version }}
@@ -113,3 +111,4 @@ jobs:
           echo "| **Build Date** | \`${{ steps.version.outputs.build_date }}\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Registry** | \`ghcr.io/zmey93/remnawave-bedolaga-telegram-bot\` |" >> $GITHUB_STEP_SUMMARY
           echo "| **Pushed** | ${{ steps.version.outputs.should_push }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| **Tags** | \`${{ steps.version.outputs.version }}\` |" >> $GITHUB_STEP_SUMMARY
