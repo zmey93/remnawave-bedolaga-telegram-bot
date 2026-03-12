@@ -1,13 +1,13 @@
 services:
   postgres:
-    image: postgres:17-alpine
+    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
     container_name: remnawave_bot_db
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${POSTGRES_DB:-remnawave_bot}
-      POSTGRES_USER: ${POSTGRES_USER:-remnawave_user}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-secure_password_123}
-      POSTGRES_INITDB_ARGS: '--encoding=UTF8 --locale=C'
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: ${POSTGRES_INITDB_ARGS:---encoding=UTF8 --locale=C}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     networks:
@@ -15,8 +15,8 @@ services:
     healthcheck:
       test:
         [
-          'CMD-SHELL',
-          'pg_isready -U ${POSTGRES_USER:-remnawave_user} -d ${POSTGRES_DB:-remnawave_bot}',
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}",
         ]
       interval: 30s
       timeout: 5s
@@ -24,40 +24,41 @@ services:
       start_period: 30s
 
   redis:
-    image: redis:7-alpine
+    image: ${REDIS_IMAGE:-redis:7-alpine}
     container_name: remnawave_bot_redis
     restart: unless-stopped
-    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    command: ${REDIS_COMMAND:-redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru}
     volumes:
       - redis_data:/data
     networks:
       - bot_network
     healthcheck:
-      test: ['CMD', 'redis-cli', 'ping']
+      test: ["CMD", "redis-cli", "ping"]
       interval: 30s
       timeout: 10s
       retries: 3
-      
+
   xray-checker:
-    image: kutovoys/xray-checker
+    image: ${XRAY_CHECKER_IMAGE:-kutovoys/xray-checker}
     container_name: xray_checker
     restart: unless-stopped
     environment:
-      - SUBSCRIPTION_URL=${XRAY_SUBSCRIPTION_URL}
-      - SUBSCRIPTION_UPDATE=true
-      - SUBSCRIPTION_UPDATE_INTERVAL=300
-      - PROXY_CHECK_INTERVAL=300
-      - PROXY_CHECK_METHOD=ip
-      - METRICS_HOST=0.0.0.0
-      - METRICS_PORT=2112
-      - METRICS_PROTECTED=true
-      - METRICS_USERNAME=doc93
-      - METRICS_PASSWORD=6185700
+      SUBSCRIPTION_URL: ${XRAY_SUBSCRIPTION_URL}
+      SUBSCRIPTION_UPDATE: ${XRAY_SUBSCRIPTION_UPDATE:-true}
+      SUBSCRIPTION_UPDATE_INTERVAL: ${XRAY_SUBSCRIPTION_UPDATE_INTERVAL:-300}
+      PROXY_CHECK_INTERVAL: ${XRAY_PROXY_CHECK_INTERVAL:-300}
+      PROXY_CHECK_METHOD: ${XRAY_PROXY_CHECK_METHOD:-ip}
+      METRICS_HOST: ${XRAY_METRICS_HOST:-0.0.0.0}
+      METRICS_PORT: ${XRAY_METRICS_PORT:-2112}
+      METRICS_PROTECTED: ${XRAY_METRICS_PROTECTED:-true}
+      METRICS_USERNAME: ${SERVER_STATUS_METRICS_USERNAME}
+      METRICS_PASSWORD: ${SERVER_STATUS_METRICS_PASSWORD}
     networks:
       - bot_network
 
   bot:
-    build: .
+    build:
+      context: ${BOT_BUILD_CONTEXT:-.}
     container_name: remnawave_bot
     restart: unless-stopped
     depends_on:
@@ -68,32 +69,32 @@ services:
     env_file:
       - .env
     environment:
-      DOCKER_ENV: 'true'
-      DATABASE_MODE: 'auto'
-      POSTGRES_HOST: 'postgres'
-      POSTGRES_PORT: '5432'
-      POSTGRES_DB: '${POSTGRES_DB:-remnawave_bot}'
-      POSTGRES_USER: '${POSTGRES_USER:-remnawave_user}'
-      POSTGRES_PASSWORD: '${POSTGRES_PASSWORD:-451f9ff680680f03e6ad507f13723bab4d052a72ff56917b}'
-      REDIS_URL: 'redis://redis:6379/0'
-      TZ: 'Europe/Moscow'
-      LOCALES_PATH: '${LOCALES_PATH:-/app/locales}'
+      DOCKER_ENV: ${DOCKER_ENV:-true}
+      DATABASE_MODE: ${DATABASE_MODE}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_URL: ${REDIS_URL}
+      TZ: ${TZ}
+      LOCALES_PATH: ${LOCALES_PATH:-/app/locales}
     volumes:
-      - ./logs:/app/logs:rw
-      - ./data:/app/data:rw
-      - ./locales:/app/locales:rw
-      - /etc/timezone:/etc/timezone:ro
-      - /etc/localtime:/etc/localtime:ro
-      - ./vpn_logo.png:/app/vpn_logo.png:ro
+      - ${BOT_LOGS_HOST_PATH:-./logs}:${BOT_LOGS_CONTAINER_PATH:-/app/logs}:rw
+      - ${BOT_DATA_HOST_PATH:-./data}:${BOT_DATA_CONTAINER_PATH:-/app/data}:rw
+      - ${LOCALES_HOST_PATH:-./locales}:${LOCALES_PATH:-/app/locales}:rw
+      - ${TZ_FILE_PATH:-/etc/timezone}:/etc/timezone:ro
+      - ${LOCALTIME_FILE_PATH:-/etc/localtime}:/etc/localtime:ro
+      - ${VPN_LOGO_HOST_PATH:-./vpn_logo.png}:${VPN_LOGO_CONTAINER_PATH:-/app/vpn_logo.png}:ro
     ports:
-      - '${WEB_API_PORT:-8080}:8080'
+      - "${WEB_API_PORT}:8080"
     networks:
       - bot_network
     healthcheck:
       test:
         [
-          'CMD-SHELL',
-          'python -c "import requests, os; requests.get(''http://localhost:8080/health'', headers={''X-API-Key'': os.environ.get(''WEB_API_DEFAULT_TOKEN'')}, timeout=5) or exit(1)"',
+          "CMD-SHELL",
+          "python -c \"import requests, os; requests.get('http://localhost:8080/health', headers={'X-API-Key': os.environ.get('WEB_API_DEFAULT_TOKEN')}, timeout=5) or exit(1)\"",
         ]
       interval: 60s
       timeout: 10s
@@ -108,11 +109,11 @@ volumes:
 
 networks:
   bot_network:
-    name: remnawave_bot_network
+    name: ${BOT_NETWORK_NAME:-remnawave_bot_network}
     driver: bridge
     ipam:
       config:
-        - subnet: 172.20.0.0/16
-          gateway: 172.20.0.1
+        - subnet: ${BOT_NETWORK_SUBNET:-172.20.0.0/16}
+          gateway: ${BOT_NETWORK_GATEWAY:-172.20.0.1}
     driver_opts:
-      com.docker.network.driver.mtu: 1350
+      com.docker.network.driver.mtu: "${BOT_NETWORK_MTU:-1350}"
