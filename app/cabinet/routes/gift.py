@@ -22,7 +22,6 @@ from app.database.models import (
     Tariff,
     TransactionType,
     User,
-    UserPromoGroup,
 )
 from app.services.guest_purchase_service import (
     GuestPurchaseError,
@@ -112,15 +111,17 @@ async def get_gift_config(
             price = base_price
 
             # Apply promo group discount
+            from app.services.pricing_engine import PricingEngine
+
             promo_group_discount = 0
             if promo_group:
                 promo_group_discount = promo_group.get_discount_percent('period', days)
                 if promo_group_discount > 0:
-                    price = int(price * (100 - promo_group_discount) / 100)
+                    price = PricingEngine.apply_discount(price, promo_group_discount)
 
             # Apply active promo offer discount (stacks on top)
             if promo_offer_discount_percent > 0:
-                price = price - price * promo_offer_discount_percent // 100
+                price = PricingEngine.apply_discount(price, promo_offer_discount_percent)
 
             # Ensure minimum price of 1 kopek after all discounts
             price = max(1, price)
@@ -249,43 +250,28 @@ async def create_gift_purchase(
             detail='Tariff not found or inactive',
         )
 
-    price_kopeks = tariff.get_price_for_period(body.period_days)
-    if price_kopeks is None:
+    # Validate that period has a configured price before locking
+    if tariff.get_price_for_period(body.period_days) is None:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail='Price is not configured for this period',
         )
 
-    # Lock user row to prevent concurrent promo offer double-spend
-    locked_result = await db.execute(
-        select(User)
-        .options(
-            selectinload(User.user_promo_groups).selectinload(UserPromoGroup.promo_group),
-            selectinload(User.promo_group),
-        )
-        .where(User.id == user.id)
-        .with_for_update()
-        .execution_options(populate_existing=True)
+    # Lock user BEFORE price computation to prevent TOCTOU on promo offer
+    from app.database.crud.user import lock_user_for_pricing
+
+    user = await lock_user_for_pricing(db, user.id)
+
+    from app.services.pricing_engine import pricing_engine
+
+    pricing_result = await pricing_engine.calculate_tariff_purchase_price(
+        tariff,
+        body.period_days,
+        device_limit=tariff.device_limit,
+        user=user,
     )
-    user = locked_result.scalar_one()
-
-    # Apply promo group discount
-    promo_group = user.get_primary_promo_group() if hasattr(user, 'get_primary_promo_group') else None
-    if promo_group is None:
-        promo_group = getattr(user, 'promo_group', None)
-
-    if promo_group:
-        discount_percent = promo_group.get_discount_percent('period', body.period_days)
-        if discount_percent > 0:
-            price_kopeks = int(price_kopeks * (100 - discount_percent) / 100)
-
-    # Apply active promo offer discount (stacks)
-    promo_offer_discount_percent = get_user_active_promo_discount_percent(user)
-    if promo_offer_discount_percent > 0:
-        price_kopeks = price_kopeks - price_kopeks * promo_offer_discount_percent // 100
-
-    # Ensure minimum price of 1 kopek after all discounts
-    price_kopeks = max(1, price_kopeks)
+    price_kopeks = max(1, pricing_result.final_total)
+    consume_promo = pricing_result.promo_offer_discount > 0
 
     # Determine buyer contact info
     if user.email:
@@ -320,9 +306,9 @@ async def create_gift_purchase(
         else:
             # 2) Fall back to Bot API (works for public usernames the bot has seen)
             try:
-                from aiogram import Bot
+                from app.bot_factory import create_bot
 
-                async with Bot(token=settings.BOT_TOKEN) as bot:
+                async with create_bot() as bot:
                     chat = await asyncio.wait_for(bot.get_chat(chat_id=f'@{tg_username}'), timeout=5.0)
                     pre_resolved_telegram_id = chat.id
             except Exception:
@@ -385,19 +371,23 @@ async def create_gift_purchase(
         # Stars payments need a Bot instance to create invoice links
         bot = None
         if body.payment_method == 'telegram_stars':
-            from aiogram import Bot
+            from app.bot_factory import create_bot
 
-            bot = Bot(token=settings.BOT_TOKEN)
+            bot = create_bot()
 
-        payment_service = PaymentService(bot=bot)
-        payment_result = await payment_service.create_guest_payment(
-            db=db,
-            amount_kopeks=price_kopeks,
-            payment_method=body.payment_method,
-            description=f'Gift: {tariff.name} ({body.period_days}d)',
-            purchase_token=purchase.token,
-            return_url=return_url,
-        )
+        try:
+            payment_service = PaymentService(bot=bot)
+            payment_result = await payment_service.create_guest_payment(
+                db=db,
+                amount_kopeks=price_kopeks,
+                payment_method=body.payment_method,
+                description=f'Gift: {tariff.name} ({body.period_days}d)',
+                purchase_token=purchase.token,
+                return_url=return_url,
+            )
+        finally:
+            if bot:
+                await bot.session.close()
 
         if payment_result is None:
             await db.rollback()
@@ -420,7 +410,7 @@ async def create_gift_purchase(
             )
 
         # Consume promo offer discount before committing gateway purchase
-        if promo_offer_discount_percent > 0 and getattr(user, 'promo_offer_discount_percent', 0):
+        if consume_promo and getattr(user, 'promo_offer_discount_percent', 0):
             user.promo_offer_discount_percent = 0
             user.promo_offer_discount_source = None
             user.promo_offer_discount_expires_at = None
@@ -485,7 +475,7 @@ async def create_gift_purchase(
         price_kopeks,
         description=f'Gift: {tariff.name} ({body.period_days}d)',
         create_transaction=False,
-        consume_promo_offer=promo_offer_discount_percent > 0,
+        consume_promo_offer=consume_promo,
     )
     if not balance_ok:
         await db.rollback()
@@ -734,7 +724,7 @@ async def activate_gift_by_code(
         raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail='Too many requests')
 
     code = body.code.strip()
-    if code.upper().startswith('GIFT-'):
+    if code.upper().startswith('GIFT-') or code.upper().startswith('GIFT_'):
         code = code[5:]
 
     if len(code) < 8:

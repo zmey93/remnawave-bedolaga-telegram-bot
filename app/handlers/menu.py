@@ -168,11 +168,9 @@ async def show_main_menu(
     db_user.last_activity = datetime.now(UTC)
     await db.commit()
 
-    has_active_subscription = bool(db_user.subscription and db_user.subscription.is_active)
-    subscription_is_active = False
-
-    if db_user.subscription:
-        subscription_is_active = db_user.subscription.is_active
+    # Multi-tariff aware: check if user has ANY active subscription
+    has_active_subscription = any(sub.is_active for sub in (getattr(db_user, 'subscriptions', None) or []))
+    subscription_is_active = has_active_subscription
 
     menu_text = await get_main_menu_text(db_user, texts, db)
 
@@ -208,7 +206,7 @@ async def show_main_menu(
         has_active_subscription=has_active_subscription,
         subscription_is_active=subscription_is_active,
         balance_kopeks=db_user.balance_kopeks,
-        subscription=db_user.subscription,
+        subscription=db_user.subscription,  # Uses primary subscription (multi-tariff compatible via property)
         show_resume_checkout=show_resume_checkout,
         has_saved_cart=has_saved_cart,
         custom_buttons=custom_buttons,
@@ -1014,11 +1012,9 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
 
     texts = get_texts(db_user.language)
 
-    has_active_subscription = bool(db_user.subscription and db_user.subscription.is_active)
-    subscription_is_active = False
-
-    if db_user.subscription:
-        subscription_is_active = db_user.subscription.is_active
+    # Multi-tariff aware: check if user has ANY active subscription
+    has_active_subscription = any(sub.is_active for sub in (getattr(db_user, 'subscriptions', None) or []))
+    subscription_is_active = has_active_subscription
 
     menu_text = await get_main_menu_text(db_user, texts, db)
 
@@ -1054,7 +1050,7 @@ async def handle_back_to_menu(callback: types.CallbackQuery, state: FSMContext, 
         has_active_subscription=has_active_subscription,
         subscription_is_active=subscription_is_active,
         balance_kopeks=db_user.balance_kopeks,
-        subscription=db_user.subscription,
+        subscription=db_user.subscription,  # Uses primary subscription (multi-tariff compatible via property)
         show_resume_checkout=show_resume_checkout,
         has_saved_cart=has_saved_cart,
         custom_buttons=custom_buttons,
@@ -1166,36 +1162,93 @@ def _insert_random_message(base_text: str, random_message: str, action_prompt: s
     return f'{base_text}\n\n{random_message}'
 
 
+async def _get_multi_tariff_status(user, texts, db: AsyncSession) -> tuple[str, str]:
+    """Build subscription status text and tariff block for multi-tariff mode.
+
+    Returns (subscription_status, tariff_info_block).
+    """
+    from app.database.crud.subscription import get_all_subscriptions_by_user_id
+
+    subscriptions = await get_all_subscriptions_by_user_id(db, user.id)
+
+    if not subscriptions:
+        return texts.t('SUB_STATUS_NONE', '❌ Отсутствует'), ''
+
+    current_time = datetime.now(UTC)
+    lines: list[str] = []
+    for sub in subscriptions:
+        tariff_name = html.escape(sub.tariff.name) if sub.tariff else 'Подписка'
+        actual = sub.actual_status
+
+        if actual in ('active', 'trial'):
+            emoji = '🟢'
+        elif actual == 'limited':
+            emoji = '🟡'
+        else:
+            emoji = '🔴'
+
+        if actual == 'expired':
+            status_suffix = ' — истекла'
+        elif actual == 'disabled':
+            status_suffix = ' — отключена'
+        elif actual == 'limited':
+            status_suffix = ' — лимит трафика'
+        elif sub.end_date and sub.end_date > current_time:
+            days_left = (sub.end_date - current_time).days
+            end_str = format_local_datetime(sub.end_date, '%d.%m.%Y')
+            status_suffix = f' — до {end_str} ({days_left} дн.)'
+        else:
+            status_suffix = ''
+
+        lines.append(f'{emoji} <b>{tariff_name}</b>{status_suffix}')
+
+    status_text = '\n<blockquote>' + '\n'.join(lines) + '</blockquote>'
+    return status_text, ''
+
+
 async def get_main_menu_text(user, texts, db: AsyncSession):
     from app.config import settings
 
-    # Загружаем информацию о тарифе если включен режим тарифов
-    tariff = None
-    is_daily_tariff = False
-    tariff_info_block = ''
+    # Multi-tariff: show summary of all subscriptions
+    if settings.is_multi_tariff_enabled():
+        subscriptions_status, tariff_info_block = await _get_multi_tariff_status(user, texts, db)
 
-    subscription = getattr(user, 'subscription', None)
-    if settings.is_tariffs_mode() and subscription and subscription.tariff_id:
-        try:
-            from app.database.crud.tariff import get_tariff_by_id
+        base_text = texts.MAIN_MENU.format(
+            user_name=html.escape(user.full_name or ''),
+            subscription_status=subscriptions_status,
+        )
 
-            tariff = await get_tariff_by_id(db, subscription.tariff_id)
-            if tariff:
-                is_daily_tariff = getattr(tariff, 'is_daily', False)
-                # Формируем краткий блок информации о тарифе для главного меню
-                tariff_info_block = f'\n📦 Тариф: {tariff.name}'
-        except Exception as e:
-            logger.debug('Не удалось загрузить тариф для главного меню', error=e)
+        if tariff_info_block:
+            action_prompt_text = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
+            if action_prompt_text in base_text:
+                base_text = base_text.replace(action_prompt_text, f'{tariff_info_block}\n\n{action_prompt_text}')
+    else:
+        # Single-tariff mode: legacy behavior
+        tariff = None
+        is_daily_tariff = False
+        tariff_info_block = ''
 
-    base_text = texts.MAIN_MENU.format(
-        user_name=user.full_name, subscription_status=_get_subscription_status(user, texts, is_daily_tariff)
-    )
+        subscription = getattr(user, 'subscription', None)
+        if settings.is_tariffs_mode() and subscription and subscription.tariff_id:
+            try:
+                from app.database.crud.tariff import get_tariff_by_id
 
-    # Добавляем информацию о тарифе перед "Выберите действие"
-    if tariff_info_block:
-        action_prompt_text = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
-        if action_prompt_text in base_text:
-            base_text = base_text.replace(action_prompt_text, f'{tariff_info_block}\n\n{action_prompt_text}')
+                tariff = await get_tariff_by_id(db, subscription.tariff_id)
+                if tariff:
+                    is_daily_tariff = getattr(tariff, 'is_daily', False)
+                    tariff_info_block = f'\n📦 Тариф: {html.escape(tariff.name)}'
+            except Exception as e:
+                logger.debug('Не удалось загрузить тариф для главного меню', error=e)
+
+        base_text = texts.MAIN_MENU.format(
+            user_name=html.escape(user.full_name or ''),
+            subscription_status=_get_subscription_status(user, texts, is_daily_tariff),
+        )
+
+        if tariff_info_block:
+            action_prompt_text = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
+            if action_prompt_text in base_text:
+                base_text = base_text.replace(action_prompt_text, f'{tariff_info_block}\n\n{action_prompt_text}')
 
     action_prompt = texts.t('MAIN_MENU_ACTION_PROMPT', 'Выберите действие:')
 
@@ -1249,7 +1302,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     """
     texts = get_texts(db_user.language)
 
-    from app.database.crud.server_squad import get_available_server_squads, get_server_ids_by_uuids
+    from app.database.crud.server_squad import get_available_server_squads
     from app.database.crud.subscription import create_paid_subscription, get_subscription_by_user_id
     from app.database.crud.transaction import create_transaction
     from app.database.crud.user import subtract_user_balance
@@ -1257,7 +1310,16 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     from app.services.subscription_renewal_service import SubscriptionRenewalService
     from app.services.subscription_service import SubscriptionService
 
-    subscription = await get_subscription_by_user_id(db, db_user.id)
+    if settings.is_multi_tariff_enabled():
+        from app.database.crud.subscription import get_active_subscriptions_by_user_id
+
+        active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+        # For menu display: prefer non-daily, most days remaining
+        non_daily = [s for s in active_subs if not getattr(s, 'is_daily_tariff', False)]
+        _eligible = non_daily or active_subs
+        subscription = max(_eligible, key=lambda s: s.days_left) if _eligible else None
+    else:
+        subscription = await get_subscription_by_user_id(db, db_user.id)
 
     # Если подписка активна — ничего не делаем
     if subscription and subscription.status == 'ACTIVE' and subscription.end_date > datetime.now(UTC):
@@ -1287,7 +1349,9 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
         if not connected_squads and available_servers:
             connected_squads = [available_servers[0].squad_uuid]
 
-    server_ids = await get_server_ids_by_uuids(db, connected_squads) if connected_squads else []
+    from app.database.crud.user import lock_user_for_pricing
+
+    db_user = await lock_user_for_pricing(db, db_user.id)
 
     balance = db_user.balance_kopeks
     available_periods = sorted(settings.get_available_subscription_periods(), reverse=True)
@@ -1299,7 +1363,7 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
     best_price = 0
     best_pricing = None  # Cache pricing result for reuse in finalize()
 
-    # Для продления используем PricingEngine (единый расчёт для всех поверхностей).
+    # PricingEngine — единый расчёт для всех поверхностей (и продление, и новая подписка).
     from app.services.pricing_engine import pricing_engine
 
     renewal_service = SubscriptionRenewalService() if subscription else None
@@ -1310,9 +1374,15 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
                 pricing_result = await pricing_engine.calculate_renewal_price(db, subscription, period, user=db_user)
                 price = pricing_result.final_total
             else:
-                price, _ = await subscription_service.calculate_subscription_price_with_months(
-                    period, traffic_limit_gb, server_ids, device_limit, db, user=db_user
+                new_pricing = await pricing_engine.calculate_classic_new_subscription_price(
+                    db,
+                    period,
+                    connected_squads,
+                    traffic_limit_gb,
+                    device_limit,
+                    user=db_user,
                 )
+                price = new_pricing.final_total
             if price <= balance:
                 best_period = period
                 best_price = price
@@ -1326,9 +1396,15 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
                 min_pricing = await pricing_engine.calculate_renewal_price(db, subscription, min_period, user=db_user)
                 min_price = min_pricing.final_total
             else:
-                min_price, _ = await subscription_service.calculate_subscription_price_with_months(
-                    min_period, traffic_limit_gb, server_ids, device_limit, db, user=db_user
+                min_new_pricing = await pricing_engine.calculate_classic_new_subscription_price(
+                    db,
+                    min_period,
+                    connected_squads,
+                    traffic_limit_gb,
+                    device_limit,
+                    user=db_user,
                 )
+                min_price = min_new_pricing.final_total
             missing = min_price - balance
             await callback.answer(
                 texts.t('INSUFFICIENT_FUNDS_DETAILED', f'❌ Недостаточно средств. Не хватает {missing // 100} ₽'),
@@ -1365,12 +1441,14 @@ async def handle_activate_button(callback: types.CallbackQuery, db_user: User, d
             )
         else:
             # Списать баланс ДО создания подписки (чтобы не было orphaned subscription при неудаче)
+            consume_promo = get_user_active_promo_discount_percent(db_user) > 0
             success = await subtract_user_balance(
                 db,
                 db_user,
                 best_price,
                 f'Активация подписки на {best_period} дней',
                 mark_as_paid_subscription=True,
+                consume_promo_offer=consume_promo,
             )
             if not success:
                 await callback.answer('❌ Недостаточно средств', show_alert=True)

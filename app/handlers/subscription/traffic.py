@@ -5,7 +5,10 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import PERIOD_PRICES, settings
-from app.database.crud.subscription import add_subscription_traffic, reactivate_subscription
+from app.database.crud.subscription import (
+    add_subscription_traffic,
+    reactivate_subscription,
+)
 from app.database.crud.transaction import create_transaction
 from app.database.crud.user import subtract_user_balance
 from app.database.models import TransactionType, User
@@ -19,18 +22,16 @@ from app.keyboards.inline import (
     get_reset_traffic_confirm_keyboard,
 )
 from app.localization.texts import get_texts
+from app.services.pricing_engine import PricingEngine
 from app.services.remnawave_service import RemnaWaveService
 from app.services.subscription_service import SubscriptionService
 from app.services.user_cart_service import user_cart_service
 from app.states import SubscriptionStates
 from app.utils.pricing_utils import (
-    apply_percentage_discount,
     calculate_prorated_price,
 )
 
 from .common import (
-    _apply_addon_discount,
-    _get_addon_discount_percent_for_user,
     _get_period_hint_from_subscription,
     get_confirm_switch_traffic_keyboard,
     get_traffic_switch_keyboard,
@@ -45,12 +46,56 @@ from .countries import (
 from .summary import present_subscription_summary
 
 
-async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def _resolve_subscription(callback, db_user, db, state=None):
+    """Resolve subscription — delegates to shared resolve_subscription_from_context."""
+    from .common import resolve_subscription_from_context
+
+    return await resolve_subscription_from_context(callback, db_user, db, state)
+
+
+async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None):
     from app.config import settings
+    from app.database.crud.subscription import get_active_subscriptions_by_user_id
     from app.database.crud.tariff import get_tariff_by_id
 
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+
+    # В режиме мульти-тарифов без явного sub_id в callback — показываем выбор подписки.
+    if settings.is_multi_tariff_enabled() and callback.data == 'buy_traffic':
+        active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+        if len(active_subs) > 1:
+            from app.database.crud.tariff import get_tariff_by_id as _get_tariff
+
+            keyboard = []
+            for sub in sorted(active_subs, key=lambda s: s.id):
+                if sub.is_trial:
+                    continue
+                tariff_name = ''
+                if sub.tariff_id:
+                    _t = await _get_tariff(db, sub.tariff_id)
+                    tariff_name = _t.name if _t else f'#{sub.id}'
+                else:
+                    tariff_name = f'Подписка #{sub.id}'
+                days_left = max(0, (sub.end_date - datetime.now(UTC)).days) if sub.end_date else 0
+                keyboard.append(
+                    [
+                        types.InlineKeyboardButton(
+                            text=f'📊 {tariff_name} ({days_left}д.)',
+                            callback_data=f'st:{sub.id}',
+                        )
+                    ]
+                )
+            keyboard.append([types.InlineKeyboardButton(text='◀️ Назад', callback_data='back_to_menu')])
+            await callback.message.edit_text(
+                '📊 <b>Докупить трафик</b>\n\nВыберите подписку:',
+                reply_markup=types.InlineKeyboardMarkup(inline_keyboard=keyboard),
+            )
+            await callback.answer()
+            return
+
+    subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
 
     if not subscription or subscription.is_trial:
         await callback.answer(
@@ -84,7 +129,7 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
         packages = tariff.get_traffic_topup_packages()
 
         period_hint_days = _get_period_hint_from_subscription(subscription)
-        traffic_discount_percent = _get_addon_discount_percent_for_user(
+        traffic_discount_percent = PricingEngine.get_addon_discount_percent(
             db_user,
             'traffic',
             period_hint_days,
@@ -106,6 +151,7 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
                 packages,
                 subscription.end_date,
                 traffic_discount_percent,
+                sub_id=sub_id,
             ),
             parse_mode='HTML',
         )
@@ -136,7 +182,7 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
 
     current_traffic = subscription.traffic_limit_gb
     period_hint_days = _get_period_hint_from_subscription(subscription)
-    traffic_discount_percent = _get_addon_discount_percent_for_user(
+    traffic_discount_percent = PricingEngine.get_addon_discount_percent(
         db_user,
         'traffic',
         period_hint_days,
@@ -153,6 +199,7 @@ async def handle_add_traffic(callback: types.CallbackQuery, db_user: User, db: A
             db_user.language,
             subscription.end_date,
             traffic_discount_percent,
+            sub_id=sub_id,
         ),
         parse_mode='HTML',
     )
@@ -197,7 +244,9 @@ def _calculate_traffic_reset_price(subscription) -> int:
     return base_price
 
 
-async def handle_reset_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def handle_reset_traffic(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None
+):
     from app.config import settings
 
     if settings.is_traffic_topup_blocked():
@@ -205,7 +254,9 @@ async def handle_reset_traffic(callback: types.CallbackQuery, db_user: User, db:
         return
 
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+    subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
 
     if not subscription or subscription.is_trial:
         await callback.answer('⌛ Эта функция доступна только для платных подписок', show_alert=True)
@@ -254,15 +305,30 @@ async def handle_reset_traffic(callback: types.CallbackQuery, db_user: User, db:
     await callback.answer()
 
 
-async def confirm_reset_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def confirm_reset_traffic(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None
+):
     from app.config import settings
 
     if settings.is_traffic_topup_blocked():
         await callback.answer('⚠️ В текущем режиме трафик фиксированный', show_alert=True)
         return
 
+    if settings.is_multi_tariff_enabled():
+        _state_data = await state.get_data() if state else {}
+        if not _state_data.get('active_subscription_id'):
+            await callback.answer('Выберите подписку через "Мои подписки"', show_alert=True)
+            return
+
+    from app.database.crud.user import lock_user_for_pricing
+
+    db_user = await lock_user_for_pricing(db, db_user.id)
+
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+    # Re-resolve after lock since db_user was refreshed
+    subscription, _ = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
 
     reset_price = _calculate_traffic_reset_price(subscription)
 
@@ -309,9 +375,10 @@ async def confirm_reset_traffic(callback: types.CallbackQuery, db_user: User, db
         remnawave_service = RemnaWaveService()
 
         user = db_user
-        if user.remnawave_uuid:
+        remnawave_uuid = getattr(subscription, 'remnawave_uuid', None) or user.remnawave_uuid
+        if remnawave_uuid:
             async with remnawave_service.get_api_client() as api:
-                await api.reset_user_traffic(user.remnawave_uuid)
+                await api.reset_user_traffic(remnawave_uuid)
 
         await create_transaction(
             db=db,
@@ -441,12 +508,14 @@ async def select_traffic(callback: types.CallbackQuery, state: FSMContext, db_us
         await callback.answer()
 
 
-async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None):
     from app.database.crud.tariff import get_tariff_by_id
 
     traffic_gb = int(callback.data.split('_')[2])
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+    subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
 
     # Получаем цену: из тарифа или из глобальных настроек
     base_price = 0
@@ -471,16 +540,21 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
         await callback.answer('⚠️ Цена для этого пакета не настроена', show_alert=True)
         return
 
+    # Lock user BEFORE price computation to prevent TOCTOU on group discount
+    from app.database.crud.user import lock_user_for_pricing
+
+    db_user = await lock_user_for_pricing(db, db_user.id)
+    # Re-resolve after lock since db_user was refreshed
+    subscription, _ = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
+
     period_hint_days = _get_period_hint_from_subscription(subscription)
-    discount_result = _apply_addon_discount(
-        db_user,
-        'traffic',
+    discounted_per_month, discount_per_month, traffic_discount_pct = PricingEngine.calculate_traffic_discount(
         base_price,
+        db_user,
         period_hint_days,
     )
-
-    discounted_per_month = discount_result['discounted']
-    discount_per_month = discount_result['discount']
     charged_days = 30
 
     # На тарифах пакеты трафика покупаются на 1 месяц (30 дней),
@@ -510,7 +584,7 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
             'traffic_gb': traffic_gb,
             'price_kopeks': price,
             'base_price_kopeks': discounted_per_month,
-            'discount_percent': discount_result['percent'],
+            'discount_percent': traffic_discount_pct,
             'source': 'bot',
             'description': f'Докупка {traffic_gb} ГБ трафика',
         }
@@ -584,8 +658,13 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
         await subscription_service.update_remnawave_user(db, subscription)
 
         # Явно включаем пользователя на панели (PATCH может не снять LIMITED-статус)
-        if db_user.remnawave_uuid and subscription.status == 'active':
-            await subscription_service.enable_remnawave_user(db_user.remnawave_uuid)
+        _en_uuid = (
+            subscription.remnawave_uuid
+            if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
+            else db_user.remnawave_uuid
+        )
+        if _en_uuid and subscription.status == 'active':
+            await subscription_service.enable_remnawave_user(_en_uuid)
 
         await create_transaction(
             db=db,
@@ -619,7 +698,7 @@ async def add_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSes
         if price > 0:
             success_text += f'\n💰 Списано: {texts.format_price(price)}'
             if total_discount_value > 0:
-                success_text += f' (скидка {discount_result["percent"]}%: -{texts.format_price(total_discount_value)})'
+                success_text += f' (скидка {traffic_discount_pct}%: -{texts.format_price(total_discount_value)})'
 
         await callback.message.edit_text(success_text, reply_markup=get_back_keyboard(db_user.language))
 
@@ -639,7 +718,9 @@ async def handle_no_traffic_packages(callback: types.CallbackQuery, db_user: Use
     )
 
 
-async def handle_switch_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def handle_switch_traffic(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None
+):
     from app.config import settings
 
     if settings.is_traffic_topup_blocked():
@@ -647,7 +728,9 @@ async def handle_switch_traffic(callback: types.CallbackQuery, db_user: User, db
         return
 
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+    subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
 
     if not subscription or subscription.is_trial:
         await callback.answer('⚠️ Эта функция доступна только для платных подписок', show_alert=True)
@@ -668,7 +751,7 @@ async def handle_switch_traffic(callback: types.CallbackQuery, db_user: User, db
     base_traffic = current_traffic - purchased_traffic
 
     period_hint_days = _get_period_hint_from_subscription(subscription)
-    traffic_discount_percent = _get_addon_discount_percent_for_user(
+    traffic_discount_percent = PricingEngine.get_addon_discount_percent(
         db_user,
         'traffic',
         period_hint_days,
@@ -693,17 +776,21 @@ async def handle_switch_traffic(callback: types.CallbackQuery, db_user: User, db
             subscription.end_date,
             traffic_discount_percent,
             base_traffic_gb=base_traffic,
+            back_callback=f'sm:{sub_id}' if settings.is_multi_tariff_enabled() and sub_id else 'subscription_settings',
         ),
-        parse_mode='HTML',
     )
 
     await callback.answer()
 
 
-async def confirm_switch_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def confirm_switch_traffic(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None
+):
     new_traffic_gb = int(callback.data.split('_')[2])
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+    subscription, sub_id = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
 
     current_traffic = subscription.traffic_limit_gb
 
@@ -722,17 +809,17 @@ async def confirm_switch_traffic(callback: types.CallbackQuery, db_user: User, d
     now = datetime.now(UTC)
     days_remaining = max(1, (subscription.end_date - now).days)
     period_hint_days = days_remaining if days_remaining > 0 else None
-    traffic_discount_percent = _get_addon_discount_percent_for_user(
+    traffic_discount_percent = PricingEngine.get_addon_discount_percent(
         db_user,
         'traffic',
         period_hint_days,
     )
 
-    discounted_old_per_month, _ = apply_percentage_discount(
+    discounted_old_per_month = PricingEngine.apply_discount(
         old_price_per_month,
         traffic_discount_percent,
     )
-    discounted_new_per_month, _ = apply_percentage_discount(
+    discounted_new_per_month = PricingEngine.apply_discount(
         new_price_per_month,
         traffic_discount_percent,
     )
@@ -790,21 +877,54 @@ async def confirm_switch_traffic(callback: types.CallbackQuery, db_user: User, d
 
     await callback.message.edit_text(
         confirm_text,
-        reply_markup=get_confirm_switch_traffic_keyboard(new_traffic_gb, total_price_difference, db_user.language),
+        reply_markup=get_confirm_switch_traffic_keyboard(
+            new_traffic_gb,
+            total_price_difference,
+            db_user.language,
+            back_callback=f'sm:{sub_id}' if settings.is_multi_tariff_enabled() and sub_id else 'subscription_settings',
+        ),
         parse_mode='HTML',
     )
 
     await callback.answer()
 
 
-async def execute_switch_traffic(callback: types.CallbackQuery, db_user: User, db: AsyncSession):
+async def execute_switch_traffic(
+    callback: types.CallbackQuery, db_user: User, db: AsyncSession, state: FSMContext = None
+):
     callback_parts = callback.data.split('_')
     new_traffic_gb = int(callback_parts[3])
-    price_difference = int(callback_parts[4])
+
+    from app.database.crud.user import lock_user_for_pricing
+
+    db_user = await lock_user_for_pricing(db, db_user.id)
 
     texts = get_texts(db_user.language)
-    subscription = db_user.subscription
+    # Re-resolve after lock since db_user was refreshed
+    subscription, _ = await _resolve_subscription(callback, db_user, db, state)
+    if subscription is None:
+        return
     current_traffic = subscription.traffic_limit_gb
+
+    # Recompute price under lock (callback-baked value may be stale)
+    purchased_traffic = getattr(subscription, 'purchased_traffic_gb', 0) or 0
+    base_traffic = current_traffic - purchased_traffic
+    old_price_per_month = settings.get_traffic_price(base_traffic)
+    new_price_per_month = settings.get_traffic_price(new_traffic_gb)
+    days_remaining = max(1, (subscription.end_date - datetime.now(UTC)).days)
+    traffic_discount_percent = PricingEngine.get_addon_discount_percent(
+        db_user,
+        'traffic',
+        days_remaining,
+    )
+    discounted_old = PricingEngine.apply_discount(old_price_per_month, traffic_discount_percent)
+    discounted_new = PricingEngine.apply_discount(new_price_per_month, traffic_discount_percent)
+    price_diff_per_month = discounted_new - discounted_old
+    if price_diff_per_month > 0:
+        price_difference = int(price_diff_per_month * days_remaining / 30)
+        price_difference = max(100, price_difference)
+    else:
+        price_difference = 0
 
     try:
         if price_difference > 0:
@@ -845,8 +965,13 @@ async def execute_switch_traffic(callback: types.CallbackQuery, db_user: User, d
         await subscription_service.update_remnawave_user(db, subscription)
 
         # Явно включаем пользователя на панели (PATCH может не снять LIMITED-статус)
-        if db_user.remnawave_uuid and subscription.status == 'active':
-            await subscription_service.enable_remnawave_user(db_user.remnawave_uuid)
+        _en_uuid = (
+            subscription.remnawave_uuid
+            if settings.is_multi_tariff_enabled() and subscription.remnawave_uuid
+            else db_user.remnawave_uuid
+        )
+        if _en_uuid and subscription.status == 'active':
+            await subscription_service.enable_remnawave_user(_en_uuid)
 
         await db.refresh(db_user)
         await db.refresh(subscription)

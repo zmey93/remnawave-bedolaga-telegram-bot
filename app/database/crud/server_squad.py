@@ -141,8 +141,12 @@ async def get_available_server_squads(
         .order_by(ServerSquad.sort_order, ServerSquad.display_name)
     )
 
-    if exclude_trial_only:
-        query = query.where(ServerSquad.is_trial_eligible.is_(False))
+    # НЕ фильтруем по is_trial_eligible — это поле означает "доступен для триала",
+    # а НЕ "только для триала". Сквад может быть одновременно триальным и платным.
+    # Фильтр exclude_trial_only убирал единственный доступный сквад, из-за чего
+    # пользователи без триала получали пустой connected_squads при покупке.
+    # Параметр exclude_trial_only сохранён для обратной совместимости, но не используется.
+    # TODO: если нужна логика "только для триала", добавить отдельное поле is_trial_only
 
     if promo_group_id is not None:
         query = query.join(ServerSquad.allowed_promo_groups).where(PromoGroup.id == promo_group_id)
@@ -313,7 +317,17 @@ async def sync_with_remnawave(db: AsyncSession, remnawave_squads: list[dict]) ->
             )
             created += 1
 
-    removed_servers = [server for uuid, server in existing_servers.items() if uuid not in remnawave_uuids]
+    # Protect external squads referenced by tariffs from being removed during sync
+    tariff_ext_uuids_result = await db.execute(
+        select(Tariff.external_squad_uuid).where(Tariff.external_squad_uuid.isnot(None))
+    )
+    protected_uuids = {row[0] for row in tariff_ext_uuids_result.fetchall()}
+
+    removed_servers = [
+        server
+        for uuid, server in existing_servers.items()
+        if uuid not in remnawave_uuids and uuid not in protected_uuids
+    ]
 
     if removed_servers:
         removed_ids = [server.id for server in removed_servers]
@@ -416,7 +430,7 @@ async def get_server_connected_users(db: AsyncSession, server_id: int) -> list[U
             ),
         )
         .where(or_(*connection_filters))
-        .options(selectinload(User.subscription))
+        .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
         .order_by(User.id)
     )
 

@@ -86,6 +86,8 @@ services:
       - ${TZ_FILE_PATH:-/etc/timezone}:/etc/timezone:ro
       - ${LOCALTIME_FILE_PATH:-/etc/localtime}:/etc/localtime:ro
       - ${VPN_LOGO_HOST_PATH:-./vpn_logo.png}:${VPN_LOGO_CONTAINER_PATH:-/app/vpn_logo.png}:ro
+      # Загруженные медиафайлы (изображения/видео для новостей)
+      - ${BOT_UPLOADS_HOST_PATH:-./uploads}:${BOT_UPLOADS_CONTAINER_PATH:-/app/uploads}:rw
     ports:
       - "${WEB_API_PORT}:8080"
     networks:

@@ -91,12 +91,14 @@ async def get_referral_info(
     referral_entitlement = max(0, total_earnings - withdrawn - pending)
     available_balance = min(user.balance_kopeks, referral_entitlement)
 
-    # Build referral link
-    referral_link = settings.get_referral_link(user.referral_code) if user.referral_code else ''
+    # Build referral links
+    referral_link = (settings.get_cabinet_referral_link(user.referral_code) or '') if user.referral_code else ''
+    bot_referral_link = settings.get_bot_referral_link(user.referral_code) if user.referral_code else ''
 
     return ReferralInfoResponse(
         referral_code=user.referral_code or '',
         referral_link=referral_link,
+        bot_referral_link=bot_referral_link,
         total_referrals=total_referrals,
         active_referrals=active_referrals,
         total_earnings_kopeks=total_earnings,
@@ -117,7 +119,11 @@ async def get_referral_list(
 ):
     """Get list of invited users."""
     # Base query with eager loading of subscription relationship
-    query = select(User).options(selectinload(User.subscription)).where(User.referred_by_id == user.id)
+    query = (
+        select(User)
+        .options(selectinload(User.subscriptions).selectinload(Subscription.tariff))
+        .where(User.referred_by_id == user.id)
+    )
 
     # Get total count
     count_query = select(func.count()).select_from(User).where(User.referred_by_id == user.id)
@@ -137,7 +143,7 @@ async def get_referral_list(
             username=r.username,
             first_name=r.first_name,
             created_at=r.created_at,
-            has_subscription=r.subscription is not None,
+            has_subscription=bool(getattr(r, 'subscriptions', None)),
             has_paid=r.has_had_paid_subscription,
         )
         for r in referrals

@@ -249,6 +249,7 @@ class TelegramStarsMixin:
                 db=db,
                 user_id=user.id,
                 period_days=period_days,
+                subscription_id=payload_data.subscription_id,
             )
         except Exception as error:
             logger.error(
@@ -259,6 +260,14 @@ class TelegramStarsMixin:
         if not subscription:
             logger.error('Не удалось активировать pending подписку пользователя', user_id=user.id)
             return False
+
+        # Consume promo-offer discount (invoice was created with discounted price)
+        try:
+            from app.utils.promo_offer import consume_user_promo_offer
+
+            await consume_user_promo_offer(db, user.id)
+        except Exception as promo_error:
+            logger.warning('Ошибка потребления промо-оффера при Stars оплате', user_id=user.id, error=promo_error)
 
         try:
             from app.services.subscription_service import SubscriptionService
@@ -295,12 +304,23 @@ class TelegramStarsMixin:
                 traffic_limit = getattr(subscription, 'traffic_limit_gb', 0) or 0
                 traffic_label = 'Безлимит' if traffic_limit == 0 else f'{int(traffic_limit)} ГБ'
 
+                tariff_line = ''
+                if settings.is_multi_tariff_enabled() and getattr(subscription, 'tariff_id', None):
+                    try:
+                        from app.database.crud.tariff import get_tariff_by_id
+
+                        _t = await get_tariff_by_id(db, subscription.tariff_id)
+                        if _t:
+                            tariff_line = f'\n📦 Тариф: «{_t.name}»'
+                    except Exception:
+                        pass
                 success_message = (
                     '✅ <b>Подписка успешно активирована!</b>\n\n'
                     f'📅 Период: {period_display} дней\n'
                     f'📱 Устройства: {getattr(subscription, "device_limit", 1)}\n'
                     f'📊 Трафик: {traffic_label}\n'
-                    f'⭐ Оплата: {stars_amount} ⭐ ({settings.format_price(amount_kopeks)})\n\n'
+                    f'⭐ Оплата: {stars_amount} ⭐ ({settings.format_price(amount_kopeks)})'
+                    f'{tariff_line}\n\n'
                     "🔗 Для подключения перейдите в раздел 'Моя подписка'"
                 )
 
@@ -434,7 +454,7 @@ class TelegramStarsMixin:
                 "❌ Описание '' не подходит для реферальной логики", description_for_referral=description_for_referral
             )
 
-        if was_first_topup and not user.has_made_first_topup:
+        if was_first_topup and not user.has_made_first_topup and not user.referred_by_id:
             user.has_made_first_topup = True
             await db.commit()
 

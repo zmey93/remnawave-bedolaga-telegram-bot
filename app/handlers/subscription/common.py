@@ -25,6 +25,64 @@ logger = structlog.get_logger(__name__)
 
 TRAFFIC_PRICES = get_traffic_prices()
 
+
+async def resolve_subscription_from_context(
+    callback,
+    db_user: User,
+    db,
+    state=None,
+) -> tuple[Subscription | None, int | None]:
+    """Resolve subscription for multi-tariff bot handlers.
+
+    Priority:
+    1. callback_data 'prefix:sub_id' (colon-separated, last part is int)
+    2. FSM state 'active_subscription_id' (set by my_subscriptions delegation)
+    3. Single active subscription (auto-select)
+    4. Legacy: db_user.subscription (single-tariff mode)
+    """
+    from app.database.crud.subscription import (
+        get_active_subscriptions_by_user_id,
+        get_subscription_by_id_for_user,
+        get_subscription_by_user_id,
+    )
+
+    if not settings.is_multi_tariff_enabled():
+        sub = await get_subscription_by_user_id(db, db_user.id)
+        return sub, getattr(sub, 'id', None) if sub else None
+
+    # 1. Try callback_data 'prefix:sub_id'
+    parts = (callback.data or '').split(':')
+    if len(parts) >= 2:
+        try:
+            sub_id = int(parts[-1])
+            sub = await get_subscription_by_id_for_user(db, sub_id, db_user.id)
+            if sub:
+                return sub, sub_id
+        except (ValueError, TypeError):
+            pass
+
+    # 2. Try FSM state
+    if state:
+        try:
+            data = await state.get_data()
+            fsm_sub_id = data.get('active_subscription_id')
+            if fsm_sub_id:
+                sub = await get_subscription_by_id_for_user(db, fsm_sub_id, db_user.id)
+                if sub:
+                    return sub, fsm_sub_id
+        except Exception:
+            pass
+
+    # 3. Auto-select if only one active subscription
+    active_subs = await get_active_subscriptions_by_user_id(db, db_user.id)
+    if len(active_subs) == 1:
+        return active_subs[0], active_subs[0].id
+
+    # 4. Cannot determine
+    await callback.answer('Выберите подписку', show_alert=True)
+    return None, None
+
+
 # ── App config cache ──
 _app_config_cache: dict[str, Any] = {}
 _app_config_cache_ts: float = 0.0
@@ -54,43 +112,6 @@ def _format_text_with_placeholders(template: str, values: dict[str, Any]) -> str
     except Exception:  # pragma: no cover - defensive logging
         logger.warning('Failed to format template with values', template=template, values=values)
         return template
-
-
-def _get_addon_discount_percent_for_user(
-    user: User | None,
-    category: str,
-    period_days_hint: int | None = None,
-) -> int:
-    if user is None:
-        return 0
-
-    promo_group = user.get_primary_promo_group()
-    if promo_group is None:
-        return 0
-
-    if not getattr(promo_group, 'apply_discounts_to_addons', True):
-        return 0
-
-    try:
-        return user.get_promo_discount(category, period_days_hint)
-    except AttributeError:
-        return 0
-
-
-def _apply_addon_discount(
-    user: User | None,
-    category: str,
-    amount: int,
-    period_days_hint: int | None = None,
-) -> dict[str, int]:
-    percent = _get_addon_discount_percent_for_user(user, category, period_days_hint)
-    discounted_amount, discount_value = apply_percentage_discount(amount, percent)
-
-    return {
-        'discounted': discounted_amount,
-        'discount': discount_value,
-        'percent': percent,
-    }
 
 
 def _get_promo_offer_discount_percent(user: User | None) -> int:
@@ -494,12 +515,14 @@ def create_deep_link(app: dict[str, Any], subscription_url: str) -> str | None:
     return redirect_link or scheme_link or subscription_url
 
 
-def get_reset_devices_confirm_keyboard(language: str = 'ru') -> InlineKeyboardMarkup:
+def get_reset_devices_confirm_keyboard(
+    language: str = 'ru', back_callback: str = 'menu_subscription'
+) -> InlineKeyboardMarkup:
     get_texts(language)
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text='✅ Да, сбросить все устройства', callback_data='confirm_reset_devices')],
-            [InlineKeyboardButton(text='❌ Отмена', callback_data='menu_subscription')],
+            [InlineKeyboardButton(text='❌ Отмена', callback_data=back_callback)],
         ]
     )
 
@@ -510,6 +533,7 @@ def get_traffic_switch_keyboard(
     subscription_end_date: datetime = None,
     discount_percent: int = 0,
     base_traffic_gb: int = None,
+    back_callback: str = 'subscription_settings',
 ) -> InlineKeyboardMarkup:
     from app.config import settings
 
@@ -587,7 +611,7 @@ def get_traffic_switch_keyboard(
         [
             InlineKeyboardButton(
                 text='⬅️ Назад' if language_code in {'ru', 'fa'} else '⬅️ Back',
-                callback_data='subscription_settings',
+                callback_data=back_callback,
             )
         ]
     )
@@ -596,7 +620,7 @@ def get_traffic_switch_keyboard(
 
 
 def get_confirm_switch_traffic_keyboard(
-    new_traffic_gb: int, price_difference: int, language: str = 'ru'
+    new_traffic_gb: int, price_difference: int, language: str = 'ru', back_callback: str = 'subscription_settings'
 ) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -606,6 +630,6 @@ def get_confirm_switch_traffic_keyboard(
                     callback_data=f'confirm_switch_traffic_{new_traffic_gb}_{price_difference}',
                 )
             ],
-            [InlineKeyboardButton(text='❌ Отмена', callback_data='subscription_settings')],
+            [InlineKeyboardButton(text='❌ Отмена', callback_data=back_callback)],
         ]
     )

@@ -342,7 +342,9 @@ async def _load_landing_tariffs(
                 effective_discount = tariff_override if tariff_override is not None else discount.percent
                 original_price_kopeks = price
                 original_price_label = settings.format_price(price)
-                price = max(1, price - (price * effective_discount // 100))
+                from app.services.pricing_engine import PricingEngine
+
+                price = max(1, PricingEngine.apply_discount(price, effective_discount))
 
             periods.append(
                 LandingTariffPeriod(
@@ -548,7 +550,7 @@ async def create_landing_purchase(
     No authentication required.
     """
     client_ip = get_client_ip(raw_request)
-    if await RateLimitCache.is_ip_rate_limited(client_ip, 'landing_purchase', limit=5, window=60, fail_closed=True):
+    if await RateLimitCache.is_ip_rate_limited(client_ip, 'landing_purchase', limit=30, window=60, fail_closed=True):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail='Too many purchase attempts, please try again later',
